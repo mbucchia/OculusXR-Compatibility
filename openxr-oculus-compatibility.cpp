@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <string>
 
 #include <intrin.h>
@@ -14,6 +15,27 @@ namespace {
 
     PFN_xrGetInstanceProcAddr nextGetInstanceProcAddr = nullptr;
     PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
+    PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
+
+    // https://stackoverflow.com/questions/865152/how-can-i-get-a-process-handle-by-its-name-in-c
+    bool IsServiceRunning(const std::wstring_view& name) {
+        PROCESSENTRY32 entry;
+        entry.dwSize = sizeof(PROCESSENTRY32);
+
+        bool found = false;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (Process32First(snapshot, &entry) == TRUE) {
+            while (Process32Next(snapshot, &entry) == TRUE) {
+                if (std::wstring_view(entry.szExeFile) == name) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+
+        return found;
+    }
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProperties
     XrResult xrGetInstanceProperties(XrInstance instance, XrInstanceProperties* instanceProperties) {
@@ -39,6 +61,54 @@ namespace {
         return result;
     }
 
+    // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystemProperties
+    XrResult xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
+        // Chain the call to the next implementation.
+        const XrResult result = nextGetSystemProperties(instance, systemId, properties);
+
+        // When Virtual Desktop is used with SteamVR, we force un-advertise the hand joints capability.
+        if (XR_SUCCEEDED(result)) {
+            // We can cache whether the service is running, because even if the application is polling xrGetSystem() and
+            // the XrSystem in use could technically change over time, it would require a restart of SteamVR, and taking
+            // down the XrInstance.
+            static const bool isVirtualDesktopServiceRunning = IsServiceRunning(L"VirtualDesktop.Server.exe");
+
+            // We do not want this override behavior with VDXR, since it may correctly support hand joints in the
+            // future. So we check for SteamVR.
+            // We intentionally allow this call to fail for robnustness.
+            XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
+            if (!nextGetInstanceProperties) {
+                // During loading of (other) API layers, the pointer has not been populated yet.
+                nextGetInstanceProcAddr(instance,
+                                        "xrGetInstanceProperties",
+                                        reinterpret_cast<PFN_xrVoidFunction*>(&nextGetInstanceProperties));
+            }
+            if (nextGetInstanceProperties) {
+                nextGetInstanceProperties(instance, &instanceProperties);
+            }
+            const std::string_view runtimeName(instanceProperties.runtimeName);
+            const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
+
+            if (isSteamVR && isVirtualDesktopServiceRunning) {
+                XrSystemHandTrackingPropertiesEXT* handTrackingProperties =
+                    reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(properties->next);
+                while (handTrackingProperties) {
+                    if (handTrackingProperties->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT) {
+                        break;
+                    }
+                    handTrackingProperties =
+                        reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(handTrackingProperties->next);
+                }
+
+                if (handTrackingProperties) {
+                    handTrackingProperties->supportsHandTracking = XR_FALSE;
+                }
+            }
+        }
+
+        return result;
+    }
+
     // Entry point for OpenXR calls.
     XrResult xrGetInstanceProcAddr(const XrInstance instance,
                                    const char* const name,
@@ -52,6 +122,9 @@ namespace {
             if (apiName == "xrGetInstanceProperties") {
                 nextGetInstanceProperties = reinterpret_cast<PFN_xrGetInstanceProperties>(*function);
                 *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetInstanceProperties);
+            } else if (apiName == "xrGetSystemProperties") {
+                nextGetSystemProperties = reinterpret_cast<PFN_xrGetSystemProperties>(*function);
+                *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetSystemProperties);
             }
 
             // Leave all unhandled calls to the next layer.
