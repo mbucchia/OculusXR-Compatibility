@@ -1,10 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <filesystem>
+#include <mutex>
 #include <string>
-
-#include <intrin.h>
-#pragma intrinsic(_ReturnAddress)
+#include <unordered_map>
 
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
@@ -13,9 +13,16 @@
 namespace {
     const std::string LayerName = "XR_APILAYER_VIRTUALDESKTOP_oculus_compatibility";
 
-    PFN_xrGetInstanceProcAddr nextGetInstanceProcAddr = nullptr;
-    PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
-    PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
+    struct Instance {
+        std::string applicationName;
+        std::string exeName;
+        PFN_xrGetInstanceProcAddr nextGetInstanceProcAddr{nullptr};
+        PFN_xrGetInstanceProperties nextGetInstanceProperties{nullptr};
+        PFN_xrGetSystemProperties nextGetSystemProperties{nullptr};
+    };
+
+    std::mutex g_instancesMutex;
+    std::unordered_map<XrInstance, Instance> g_instances;
 
     // https://stackoverflow.com/questions/865152/how-can-i-get-a-process-handle-by-its-name-in-c
     bool IsServiceRunning(const std::wstring_view& name) {
@@ -39,21 +46,32 @@ namespace {
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProperties
     XrResult xrGetInstanceProperties(XrInstance instance, XrInstanceProperties* instanceProperties) {
+        PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
+        std::string applicationName;
+        std::string exeName;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                nextGetInstanceProperties = it->second.nextGetInstanceProperties;
+                applicationName = it->second.applicationName;
+                exeName = it->second.exeName;
+            }
+        }
+        if (!nextGetInstanceProperties) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
         // Chain the call to the next implementation.
         const XrResult result = nextGetInstanceProperties(instance, instanceProperties);
 
         // The OculusXR Plugin only loads successfully when the returned OpenXR runtime name is "Oculus". We fake that
         // if the caller is the OculusXR Plugin, but we return the real runtime name otherwise.
+        // Some games (like 7th Guest VR) do not play well when forcing the runtime name, so we exclude them.
         if (XR_SUCCEEDED(result)) {
-            HMODULE oculusXrPlugin, ovrPlugin, callerModule;
-            if (GetModuleHandleExA(
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "OculusXRPlugin.dll", &oculusXrPlugin) &&
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "OVRPlugin.dll", &ovrPlugin) &&
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)_ReturnAddress(),
-                                   &callerModule) &&
-                (callerModule == oculusXrPlugin || callerModule == ovrPlugin)) {
+            const bool needOculusXrPluginWorkaround =
+                applicationName.find("Oculus VR Plugin") == 0 && exeName != "The7thGuestVR-Win64-Shipping.exe";
+            if (needOculusXrPluginWorkaround) {
                 sprintf_s(instanceProperties->runtimeName, sizeof(instanceProperties->runtimeName), "Oculus");
             }
         }
@@ -63,6 +81,20 @@ namespace {
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystemProperties
     XrResult xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
+        PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
+        PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                nextGetSystemProperties = it->second.nextGetSystemProperties;
+                nextGetInstanceProperties = it->second.nextGetInstanceProperties;
+            }
+        }
+        if (!nextGetSystemProperties || !nextGetInstanceProperties) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
         // Chain the call to the next implementation.
         const XrResult result = nextGetSystemProperties(instance, systemId, properties);
 
@@ -75,17 +107,9 @@ namespace {
 
             // We do not want this override behavior with VDXR, since it may correctly support hand joints in the
             // future. So we check for SteamVR.
-            // We intentionally allow this call to fail for robnustness.
             XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
-            if (!nextGetInstanceProperties) {
-                // During loading of (other) API layers, the pointer has not been populated yet.
-                nextGetInstanceProcAddr(instance,
-                                        "xrGetInstanceProperties",
-                                        reinterpret_cast<PFN_xrVoidFunction*>(&nextGetInstanceProperties));
-            }
-            if (nextGetInstanceProperties) {
-                nextGetInstanceProperties(instance, &instanceProperties);
-            }
+            // We intentionally allow this call to fail for robnustness.
+            nextGetInstanceProperties(instance, &instanceProperties);
             const std::string_view runtimeName(instanceProperties.runtimeName);
             const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
 
@@ -113,6 +137,18 @@ namespace {
     XrResult xrGetInstanceProcAddr(const XrInstance instance,
                                    const char* const name,
                                    PFN_xrVoidFunction* const function) {
+        PFN_xrGetInstanceProcAddr nextGetInstanceProcAddr = nullptr;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                nextGetInstanceProcAddr = it->second.nextGetInstanceProcAddr;
+            }
+        }
+        if (!nextGetInstanceProcAddr) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
         // Call the chain to resolve the next function pointer.
         const XrResult result = nextGetInstanceProcAddr(instance, name, function);
         if (XR_SUCCEEDED(result)) {
@@ -120,10 +156,8 @@ namespace {
 
             // Intercept the calls handled by our layer.
             if (apiName == "xrGetInstanceProperties") {
-                nextGetInstanceProperties = reinterpret_cast<PFN_xrGetInstanceProperties>(*function);
                 *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetInstanceProperties);
             } else if (apiName == "xrGetSystemProperties") {
-                nextGetSystemProperties = reinterpret_cast<PFN_xrGetSystemProperties>(*function);
                 *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetSystemProperties);
             }
 
@@ -148,13 +182,38 @@ namespace {
             return XR_ERROR_INITIALIZATION_FAILED;
         }
 
-        // Store the next xrGetInstanceProcAddr to resolve the functions no handled by our layer.
-        nextGetInstanceProcAddr = apiLayerInfo->nextInfo->nextGetInstanceProcAddr;
+        Instance newInstance{};
+
+        // Store the next xrGetInstanceProcAddr to resolve the functions handled by our layer.
+        newInstance.nextGetInstanceProcAddr = apiLayerInfo->nextInfo->nextGetInstanceProcAddr;
 
         // Call the chain to create the instance.
         XrApiLayerCreateInfo chainApiLayerInfo = *apiLayerInfo;
         chainApiLayerInfo.nextInfo = apiLayerInfo->nextInfo->next;
-        return apiLayerInfo->nextInfo->nextCreateApiLayerInstance(instanceCreateInfo, &chainApiLayerInfo, instance);
+        const XrResult result =
+            apiLayerInfo->nextInfo->nextCreateApiLayerInstance(instanceCreateInfo, &chainApiLayerInfo, instance);
+        if (XR_SUCCEEDED(result)) {
+            // Fill out the context state.
+            newInstance.applicationName = instanceCreateInfo->applicationInfo.applicationName;
+            {
+                char path[_MAX_PATH];
+                GetModuleFileNameA(nullptr, path, sizeof(path));
+                std::filesystem::path fullPath(path);
+                newInstance.exeName = fullPath.filename().string();
+            }
+            newInstance.nextGetInstanceProcAddr(
+                *instance,
+                "xrGetInstanceProperties",
+                reinterpret_cast<PFN_xrVoidFunction*>(&newInstance.nextGetInstanceProperties));
+            newInstance.nextGetInstanceProcAddr(
+                *instance,
+                "xrGetSystemProperties",
+                reinterpret_cast<PFN_xrVoidFunction*>(&newInstance.nextGetSystemProperties));
+
+            std::unique_lock lock(g_instancesMutex);
+            g_instances.insert_or_assign(*instance, std::move(newInstance));
+        }
+        return result;
     }
 
 } // namespace
