@@ -1,10 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
@@ -16,13 +18,52 @@ namespace {
     struct Instance {
         std::string applicationName;
         std::string exeName;
+        bool isOculusXR{false};
+        bool isSystemQueried{false};
+        bool isSteamVRwithVirtualDesktop{false};
+
+        XrSession activeSession{XR_NULL_HANDLE};
+
+        std::vector<XrAction> actionsForMenu;
+        std::vector<XrAction> actionsForX;
+        std::vector<XrAction> actionsForY;
+
+        // Functions we override.
         PFN_xrGetInstanceProcAddr nextGetInstanceProcAddr{nullptr};
         PFN_xrGetInstanceProperties nextGetInstanceProperties{nullptr};
+        PFN_xrGetSystem nextGetSystem{nullptr};
         PFN_xrGetSystemProperties nextGetSystemProperties{nullptr};
+        PFN_xrSuggestInteractionProfileBindings nextSuggestInteractionProfileBindings{nullptr};
+        PFN_xrCreateSession nextCreateSession{nullptr};
+        PFN_xrGetActionStateBoolean nextGetActionStateBoolean{nullptr};
+
+        // Dependencies.
+        PFN_xrStringToPath nextStringToPath{nullptr};
+        PFN_xrPathToString nextPathToString{nullptr};
     };
 
+    // NOTE: We do not retire instances/sessions from these sets. Creating instances and sessions is uncommon-enough
+    // that we let them leak overtime without a significant impact.
     std::mutex g_instancesMutex;
     std::unordered_map<XrInstance, Instance> g_instances;
+    std::unordered_map<XrSession, XrInstance> g_sessionsToInstances;
+
+    inline bool startsWith(const std::string& str, const std::string& substr) {
+        return str.find(substr) == 0;
+    }
+
+    inline bool endsWith(const std::string& str, const std::string& substr) {
+        const auto pos = str.find(substr);
+        return pos != std::string::npos && pos == str.size() - substr.size();
+    }
+
+    std::string rreplace(const std::string& str, const std::string& from, const std::string& to) {
+        std::string copy(str);
+        const size_t start_pos = str.rfind(from);
+        copy.replace(start_pos, from.length(), to);
+
+        return copy;
+    }
 
     // https://stackoverflow.com/questions/865152/how-can-i-get-a-process-handle-by-its-name-in-c
     bool IsServiceRunning(const std::wstring_view& name) {
@@ -47,15 +88,16 @@ namespace {
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProperties
     XrResult xrGetInstanceProperties(XrInstance instance, XrInstanceProperties* instanceProperties) {
         PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
-        std::string applicationName;
+        bool isOculusXR = false;
         std::string exeName;
         {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
             if (it != g_instances.cend()) {
-                nextGetInstanceProperties = it->second.nextGetInstanceProperties;
-                applicationName = it->second.applicationName;
-                exeName = it->second.exeName;
+                const Instance& state = it->second;
+                nextGetInstanceProperties = state.nextGetInstanceProperties;
+                isOculusXR = state.isOculusXR;
+                exeName = state.exeName;
             }
         }
         if (!nextGetInstanceProperties) {
@@ -69,10 +111,60 @@ namespace {
         // if the caller is the OculusXR Plugin, but we return the real runtime name otherwise.
         // Some games (like 7th Guest VR) do not play well when forcing the runtime name, so we exclude them.
         if (XR_SUCCEEDED(result)) {
-            const bool needOculusXrPluginWorkaround =
-                applicationName.find("Oculus VR Plugin") == 0 && exeName != "The7thGuestVR-Win64-Shipping.exe";
+            const bool needOculusXrPluginWorkaround = isOculusXR && exeName != "The7thGuestVR-Win64-Shipping.exe";
             if (needOculusXrPluginWorkaround) {
                 sprintf_s(instanceProperties->runtimeName, sizeof(instanceProperties->runtimeName), "Oculus");
+            }
+        }
+
+        return result;
+    }
+
+    // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystem
+    XrResult xrGetSystem(XrInstance instance, const XrSystemGetInfo* getInfo, XrSystemId* systemId) {
+        PFN_xrGetSystem nextGetSystem = nullptr;
+        PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
+        bool isSystemQueried = false;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                const Instance& state = it->second;
+                nextGetSystem = state.nextGetSystem;
+                nextGetInstanceProperties = state.nextGetInstanceProperties;
+                isSystemQueried = state.isSystemQueried;
+            }
+        }
+        if (!nextGetSystem || !nextGetInstanceProperties) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
+        // Chain the call to the next implementation.
+        const XrResult result = nextGetSystem(instance, getInfo, systemId);
+
+        if (XR_SUCCEEDED(result) && getInfo->formFactor == XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) {
+            if (!isSystemQueried) {
+                // We can cache whether the service is running, because even if the application is polling xrGetSystem()
+                // and the XrSystem in use could technically change over time, it would require a restart of SteamVR,
+                // and taking down the XrInstance.
+                static const bool isVirtualDesktopServiceRunning = IsServiceRunning(L"VirtualDesktop.Server.exe");
+
+                // Check that the runtime is SteamVR.
+                XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
+                // We intentionally allow this call to fail for robnustness.
+                nextGetInstanceProperties(instance, &instanceProperties);
+                const std::string_view runtimeName(instanceProperties.runtimeName);
+                const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
+
+                {
+                    std::unique_lock lock(g_instancesMutex);
+                    const auto it = g_instances.find(instance);
+                    if (it != g_instances.cend()) {
+                        Instance& state = it->second;
+                        state.isSystemQueried = true;
+                        state.isSteamVRwithVirtualDesktop = isSteamVR && isVirtualDesktopServiceRunning;
+                    }
+                }
             }
         }
 
@@ -82,16 +174,17 @@ namespace {
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystemProperties
     XrResult xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
         PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
-        PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
+        bool isSteamVRwithVirtualDesktop = false;
         {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
             if (it != g_instances.cend()) {
-                nextGetSystemProperties = it->second.nextGetSystemProperties;
-                nextGetInstanceProperties = it->second.nextGetInstanceProperties;
+                const Instance& state = it->second;
+                nextGetSystemProperties = state.nextGetSystemProperties;
+                isSteamVRwithVirtualDesktop = state.isSteamVRwithVirtualDesktop;
             }
         }
-        if (!nextGetSystemProperties || !nextGetInstanceProperties) {
+        if (!nextGetSystemProperties) {
             return XR_ERROR_INSTANCE_LOST;
         }
 
@@ -100,20 +193,7 @@ namespace {
 
         // When Virtual Desktop is used with SteamVR, we force un-advertise the hand joints capability.
         if (XR_SUCCEEDED(result)) {
-            // We can cache whether the service is running, because even if the application is polling xrGetSystem() and
-            // the XrSystem in use could technically change over time, it would require a restart of SteamVR, and taking
-            // down the XrInstance.
-            static const bool isVirtualDesktopServiceRunning = IsServiceRunning(L"VirtualDesktop.Server.exe");
-
-            // We do not want this override behavior with VDXR, since it may correctly support hand joints in the
-            // future. So we check for SteamVR.
-            XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
-            // We intentionally allow this call to fail for robnustness.
-            nextGetInstanceProperties(instance, &instanceProperties);
-            const std::string_view runtimeName(instanceProperties.runtimeName);
-            const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
-
-            if (isSteamVR && isVirtualDesktopServiceRunning) {
+            if (isSteamVRwithVirtualDesktop) {
                 XrSystemHandTrackingPropertiesEXT* handTrackingProperties =
                     reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(properties->next);
                 while (handTrackingProperties) {
@@ -133,6 +213,226 @@ namespace {
         return result;
     }
 
+    // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrSuggestInteractionProfileBindings
+    XrResult xrSuggestInteractionProfileBindings(XrInstance instance,
+                                                 const XrInteractionProfileSuggestedBinding* suggestedBindings) {
+        PFN_xrSuggestInteractionProfileBindings nextSuggestInteractionProfileBindings = nullptr;
+        PFN_xrStringToPath nextStringToPath = nullptr;
+        PFN_xrPathToString nextPathToString = nullptr;
+        bool isOculusXRonSteamVRwithVirtualDesktop = false;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                const Instance& state = it->second;
+                nextSuggestInteractionProfileBindings = state.nextSuggestInteractionProfileBindings;
+                nextStringToPath = state.nextStringToPath;
+                nextPathToString = state.nextPathToString;
+                isOculusXRonSteamVRwithVirtualDesktop = state.isOculusXR && state.isSteamVRwithVirtualDesktop;
+            }
+        }
+        if (!nextSuggestInteractionProfileBindings || !nextStringToPath || !nextPathToString) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
+        const auto getPath = [nextPathToString, instance](XrPath path) {
+            char buf[XR_MAX_PATH_LENGTH];
+            uint32_t count = 0;
+            // We intentionally allow this call to fail for robnustness.
+            nextPathToString(instance, path, sizeof(buf), &count, buf);
+            std::string str;
+            str.assign(buf, count - 1);
+            return str;
+        };
+
+        XrInteractionProfileSuggestedBinding copySuggestedBindings = *suggestedBindings;
+        std::vector<XrActionSuggestedBinding> actionBindings;
+
+        // When the OculusXR Plugin is used on Virtual Desktop with SteamVR, we remap the Menu button to deconflict with
+        // SteamVR dashboard.
+        // We only do this for the Oculus Touch Interaction profile, since we assume OculusXR will always provide
+        // bindings for it.
+        const bool isOculusTouchInteractionProfile =
+            getPath(copySuggestedBindings.interactionProfile) == "/interaction_profiles/oculus/touch_controller";
+        if (isOculusXRonSteamVRwithVirtualDesktop && isOculusTouchInteractionProfile) {
+            std::vector<uint32_t> entriesForMenuAction;
+            std::vector<uint32_t> entriesForXAction;
+            std::vector<uint32_t> entriesForYAction;
+            for (uint32_t i = 0; i < copySuggestedBindings.countSuggestedBindings; i++) {
+                const auto actionPath = getPath(copySuggestedBindings.suggestedBindings[i].binding);
+                if (endsWith(actionPath, "/input/menu/click") || endsWith(actionPath, "/input/menu")) {
+                    entriesForMenuAction.push_back(i);
+                } else if (endsWith(actionPath, "/input/x/click") || endsWith(actionPath, "/input/x")) {
+                    entriesForXAction.push_back(i);
+                } else if (endsWith(actionPath, "/input/y/click") || endsWith(actionPath, "/input/y")) {
+                    entriesForYAction.push_back(i);
+                }
+            }
+
+            if (!entriesForMenuAction.empty()) {
+                actionBindings.assign(copySuggestedBindings.suggestedBindings,
+                                      copySuggestedBindings.suggestedBindings +
+                                          copySuggestedBindings.countSuggestedBindings);
+
+                // Determine our best remapping option.
+                const bool remapXtoMenu = entriesForXAction.empty();
+                const bool remapYtoMenu = !remapXtoMenu && entriesForYAction.empty();
+                const bool remapXYtoMenu = !remapXtoMenu && !remapYtoMenu;
+
+                for (uint32_t index : entriesForMenuAction) {
+                    if (remapXtoMenu || remapXYtoMenu) {
+                        // We intentionally allow this call to fail for robnustness.
+                        nextStringToPath(instance, "/user/hand/left/input/x/click", &actionBindings[index].binding);
+                    } else if (remapYtoMenu) {
+                        // We intentionally allow this call to fail for robnustness.
+                        nextStringToPath(instance, "/user/hand/left/input/y/click", &actionBindings[index].binding);
+                    }
+                }
+
+                {
+                    std::unique_lock lock(g_instancesMutex);
+                    const auto it = g_instances.find(instance);
+                    if (it != g_instances.cend()) {
+                        Instance& state = it->second;
+                        state.actionsForMenu.clear();
+                        state.actionsForX.clear();
+                        state.actionsForY.clear();
+
+                        if (remapXYtoMenu) {
+                            for (uint32_t index : entriesForMenuAction) {
+                                state.actionsForMenu.push_back(actionBindings[index].action);
+                            }
+
+                            // Make sure we will block X and Y when X+Y is pressed.
+                            for (uint32_t index : entriesForXAction) {
+                                state.actionsForX.push_back(actionBindings[index].action);
+                            }
+                            for (uint32_t index : entriesForYAction) {
+                                state.actionsForY.push_back(actionBindings[index].action);
+                            }
+                        }
+                    }
+                }
+
+                copySuggestedBindings.suggestedBindings = actionBindings.data();
+                copySuggestedBindings.countSuggestedBindings = (uint32_t)actionBindings.size();
+            }
+        }
+
+        // Chain the call to the next implementation.
+        const XrResult result = nextSuggestInteractionProfileBindings(instance, &copySuggestedBindings);
+
+        return result;
+    }
+
+    // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
+    XrResult xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
+        PFN_xrCreateSession nextCreateSession = nullptr;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_instances.find(instance);
+            if (it != g_instances.cend()) {
+                const Instance& state = it->second;
+                nextCreateSession = state.nextCreateSession;
+            }
+        }
+        if (!nextCreateSession) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
+        // Chain the call to the next implementation.
+        const XrResult result = nextCreateSession(instance, createInfo, session);
+
+        if (XR_SUCCEEDED(result)) {
+            std::unique_lock lock(g_instancesMutex);
+            g_sessionsToInstances.insert_or_assign(*session, instance);
+        }
+
+        return result;
+    }
+
+    // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetActionStateBoolean
+    XrResult xrGetActionStateBoolean(XrSession session,
+                                     const XrActionStateGetInfo* getInfo,
+                                     XrActionStateBoolean* state) {
+        XrInstance instance = XR_NULL_HANDLE;
+        PFN_xrGetActionStateBoolean nextGetActionStateBoolean = nullptr;
+        PFN_xrStringToPath nextStringToPath = nullptr;
+        bool isMenuAction = false;
+        bool isXAction = false;
+        bool isYAction = false;
+        XrAction actionForX = XR_NULL_HANDLE;
+        XrAction actionForY = XR_NULL_HANDLE;
+        {
+            std::unique_lock lock(g_instancesMutex);
+            const auto it = g_sessionsToInstances.find(session);
+            if (it != g_sessionsToInstances.cend()) {
+                instance = it->second;
+            }
+            const auto it2 = g_instances.find(instance);
+            if (it2 != g_instances.cend()) {
+                const Instance& state = it2->second;
+                nextGetActionStateBoolean = state.nextGetActionStateBoolean;
+                nextStringToPath = state.nextStringToPath;
+                if (getInfo) {
+                    isMenuAction =
+                        std::find(state.actionsForMenu.cbegin(), state.actionsForMenu.cend(), getInfo->action) !=
+                        state.actionsForMenu.cend();
+                    isXAction = std::find(state.actionsForX.cbegin(), state.actionsForX.cend(), getInfo->action) !=
+                                state.actionsForX.cend();
+                    isYAction = std::find(state.actionsForY.cbegin(), state.actionsForY.cend(), getInfo->action) !=
+                                state.actionsForY.cend();
+                }
+                if (!state.actionsForX.empty()) {
+                    actionForX = state.actionsForX[0];
+                }
+                if (!state.actionsForY.empty()) {
+                    actionForY = state.actionsForY[0];
+                }
+            }
+        }
+        if (!nextGetActionStateBoolean || !nextStringToPath) {
+            return XR_ERROR_INSTANCE_LOST;
+        }
+
+        // Chain the call to the next implementation.
+        const XrResult result = nextGetActionStateBoolean(session, getInfo, state);
+
+        // Apply our remapping when needed.
+        if (XR_SUCCEEDED(result)) {
+            if ((isMenuAction || isXAction || isYAction) && state->isActive && state->currentState == XR_TRUE) {
+                // Check the other button.
+                XrActionStateBoolean stateForOther{XR_TYPE_ACTION_STATE_BOOLEAN};
+                XrActionStateGetInfo getInfoForOther{XR_TYPE_ACTION_STATE_GET_INFO};
+                getInfoForOther.action = isYAction ? actionForX : actionForY;
+                // Try using the left subaction path, fallback to no subaction path on failure.
+                nextStringToPath(instance, "/user/hand/left", &getInfoForOther.subactionPath);
+                if (XR_FAILED(nextGetActionStateBoolean(session, &getInfoForOther, &stateForOther))) {
+                    getInfoForOther.subactionPath = XR_NULL_PATH;
+                    // We intentionally allow this call to fail for robnustness.
+                    nextGetActionStateBoolean(session, &getInfoForOther, &stateForOther);
+                }
+                if (stateForOther.isActive) {
+                    if (isMenuAction) {
+                        // Couple the inputs to emulate the Menu button.
+                        state->currentState = stateForOther.currentState;
+                        state->changedSinceLastSync =
+                            state->changedSinceLastSync == XR_TRUE || stateForOther.changedSinceLastSync == XR_TRUE;
+                        state->lastChangeTime = std::max(state->lastChangeTime, stateForOther.lastChangeTime);
+                    } else if (stateForOther.currentState) {
+                        // Block the input when X+Y is pressed.
+                        state->currentState = XR_FALSE;
+                        state->changedSinceLastSync =
+                            state->changedSinceLastSync == XR_TRUE || stateForOther.changedSinceLastSync == XR_TRUE;
+                        state->lastChangeTime = std::max(state->lastChangeTime, stateForOther.lastChangeTime);
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
     // Entry point for OpenXR calls.
     XrResult xrGetInstanceProcAddr(const XrInstance instance,
                                    const char* const name,
@@ -142,7 +442,8 @@ namespace {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
             if (it != g_instances.cend()) {
-                nextGetInstanceProcAddr = it->second.nextGetInstanceProcAddr;
+                const Instance& state = it->second;
+                nextGetInstanceProcAddr = state.nextGetInstanceProcAddr;
             }
         }
         if (!nextGetInstanceProcAddr) {
@@ -155,11 +456,22 @@ namespace {
             const std::string_view apiName(name);
 
             // Intercept the calls handled by our layer.
-            if (apiName == "xrGetInstanceProperties") {
-                *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetInstanceProperties);
-            } else if (apiName == "xrGetSystemProperties") {
-                *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetSystemProperties);
+
+#define REDIRECT_XR_PROC(proc)                                                                                         \
+    else if (apiName == "xr" #proc) {                                                                                  \
+        *function = reinterpret_cast<PFN_xrVoidFunction>(xr##proc);                                                    \
+    }
+
+            if (false) {
             }
+            REDIRECT_XR_PROC(GetInstanceProperties)
+            REDIRECT_XR_PROC(GetSystem)
+            REDIRECT_XR_PROC(GetSystemProperties)
+            REDIRECT_XR_PROC(SuggestInteractionProfileBindings)
+            REDIRECT_XR_PROC(CreateSession)
+            REDIRECT_XR_PROC(GetActionStateBoolean)
+
+#undef REDIRECT_XR_PROC
 
             // Leave all unhandled calls to the next layer.
         }
@@ -201,14 +513,22 @@ namespace {
                 std::filesystem::path fullPath(path);
                 newInstance.exeName = fullPath.filename().string();
             }
-            newInstance.nextGetInstanceProcAddr(
-                *instance,
-                "xrGetInstanceProperties",
-                reinterpret_cast<PFN_xrVoidFunction*>(&newInstance.nextGetInstanceProperties));
-            newInstance.nextGetInstanceProcAddr(
-                *instance,
-                "xrGetSystemProperties",
-                reinterpret_cast<PFN_xrVoidFunction*>(&newInstance.nextGetSystemProperties));
+            newInstance.isOculusXR = startsWith(newInstance.applicationName, "Oculus VR Plugin");
+
+#define GET_XR_PROC(proc)                                                                                              \
+    newInstance.nextGetInstanceProcAddr(                                                                               \
+        *instance, "xr" #proc, reinterpret_cast<PFN_xrVoidFunction*>(&newInstance.next##proc));
+
+            GET_XR_PROC(GetInstanceProperties);
+            GET_XR_PROC(GetSystem);
+            GET_XR_PROC(GetSystemProperties);
+            GET_XR_PROC(SuggestInteractionProfileBindings);
+            GET_XR_PROC(CreateSession);
+            GET_XR_PROC(GetActionStateBoolean);
+            GET_XR_PROC(StringToPath);
+            GET_XR_PROC(PathToString);
+
+#undef GET_XR_PROC
 
             std::unique_lock lock(g_instancesMutex);
             g_instances.insert_or_assign(*instance, std::move(newInstance));
