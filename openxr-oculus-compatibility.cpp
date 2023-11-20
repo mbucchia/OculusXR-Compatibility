@@ -8,12 +8,33 @@
 #include <unordered_map>
 #include <vector>
 
+#include <traceloggingactivity.h>
+#include <traceloggingprovider.h>
+
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
 #include "loader_interfaces.h"
 
 namespace {
     const std::string LayerName = "XR_APILAYER_VIRTUALDESKTOP_oculus_compatibility";
+
+#pragma region "Tracelogging"
+
+    // {cbf3adcd-42b1-4c38-830b-95980af201f6}
+    TRACELOGGING_DEFINE_PROVIDER(g_traceProvider,
+                                 "VirtualDesktopOculusCompat",
+                                 (0xcbf3adcd, 0x42b1, 0x4c38, 0x93, 0x0b, 0x95, 0x98, 0x0a, 0xf2, 0x01, 0xf6));
+
+#define TraceLocalActivity(activity) TraceLoggingActivity<g_traceProvider> activity;
+#define TLArg(var, ...) TraceLoggingValue(var, ##__VA_ARGS__)
+#define TLPArg(var, ...) TraceLoggingPointer(var, ##__VA_ARGS__)
+#ifdef _M_IX86
+#define TLXArg TLArg
+#else
+#define TLXArg TLPArg
+#endif
+
+#pragma endregion
 
     struct Instance {
         std::string applicationName;
@@ -87,6 +108,9 @@ namespace {
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProperties
     XrResult xrGetInstanceProperties(XrInstance instance, XrInstanceProperties* instanceProperties) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrGetInstanceProperties");
+
         PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
         bool isOculusXR = false;
         std::string exeName;
@@ -113,15 +137,21 @@ namespace {
         if (XR_SUCCEEDED(result)) {
             const bool needOculusXrPluginWorkaround = isOculusXR && exeName != "The7thGuestVR-Win64-Shipping.exe";
             if (needOculusXrPluginWorkaround) {
+                TraceLoggingWriteTagged(local, "xrGetInstanceProperties", TLArg("OverrideRuntimeName", "Action"));
                 sprintf_s(instanceProperties->runtimeName, sizeof(instanceProperties->runtimeName), "Oculus");
             }
         }
+
+        TraceLoggingWriteStop(local, "xrGetInstanceProperties", TLArg((int)result, "Result"));
 
         return result;
     }
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystem
     XrResult xrGetSystem(XrInstance instance, const XrSystemGetInfo* getInfo, XrSystemId* systemId) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrGetSystem");
+
         PFN_xrGetSystem nextGetSystem = nullptr;
         PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
         bool isSystemQueried = false;
@@ -151,10 +181,15 @@ namespace {
 
                 // Check that the runtime is SteamVR.
                 XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
-                // We intentionally allow this call to fail for robnustness.
+                // We intentionally allow this call to fail for robustness.
                 nextGetInstanceProperties(instance, &instanceProperties);
                 const std::string_view runtimeName(instanceProperties.runtimeName);
                 const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
+
+                TraceLoggingWriteTagged(local,
+                                        "xrGetSystem",
+                                        TLArg(isVirtualDesktopServiceRunning, "IsVirtualDesktop"),
+                                        TLArg(isSteamVR, "IsSteamVR"));
 
                 {
                     std::unique_lock lock(g_instancesMutex);
@@ -168,11 +203,16 @@ namespace {
             }
         }
 
+        TraceLoggingWriteStop(local, "xrGetSystem", TLArg((int)result, "Result"));
+
         return result;
     }
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystemProperties
     XrResult xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProperties* properties) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrGetSystemProperties");
+
         PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
         bool isSteamVRwithVirtualDesktop = false;
         {
@@ -205,10 +245,14 @@ namespace {
                 }
 
                 if (handTrackingProperties) {
+                    TraceLoggingWriteTagged(
+                        local, "xrGetSystemProperties", TLArg("OverrideSupportsHandTracking", "Action"));
                     handTrackingProperties->supportsHandTracking = XR_FALSE;
                 }
             }
         }
+
+        TraceLoggingWriteStop(local, "xrGetSystemProperties", TLArg((int)result, "Result"));
 
         return result;
     }
@@ -216,6 +260,9 @@ namespace {
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrSuggestInteractionProfileBindings
     XrResult xrSuggestInteractionProfileBindings(XrInstance instance,
                                                  const XrInteractionProfileSuggestedBinding* suggestedBindings) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrSuggestInteractionProfileBindings");
+
         PFN_xrSuggestInteractionProfileBindings nextSuggestInteractionProfileBindings = nullptr;
         PFN_xrStringToPath nextStringToPath = nullptr;
         PFN_xrPathToString nextPathToString = nullptr;
@@ -238,7 +285,7 @@ namespace {
         const auto getPath = [nextPathToString, instance](XrPath path) {
             char buf[XR_MAX_PATH_LENGTH];
             uint32_t count = 0;
-            // We intentionally allow this call to fail for robnustness.
+            // We intentionally allow this call to fail for robustness.
             nextPathToString(instance, path, sizeof(buf), &count, buf);
             std::string str;
             str.assign(buf, count - 1);
@@ -269,6 +316,12 @@ namespace {
                 }
             }
 
+            TraceLoggingWriteTagged(local,
+                                    "xrSuggestInteractionProfileBindings",
+                                    TLArg(entriesForMenuAction.size(), "NumMenuActions"),
+                                    TLArg(entriesForXAction.size(), "NumXActions"),
+                                    TLArg(entriesForYAction.size(), "NumYActions"));
+
             if (!entriesForMenuAction.empty()) {
                 actionBindings.assign(copySuggestedBindings.suggestedBindings,
                                       copySuggestedBindings.suggestedBindings +
@@ -281,11 +334,27 @@ namespace {
 
                 for (uint32_t index : entriesForMenuAction) {
                     if (remapXtoMenu || remapXYtoMenu) {
-                        // We intentionally allow this call to fail for robnustness.
-                        nextStringToPath(instance, "/user/hand/left/input/x/click", &actionBindings[index].binding);
+                        // We intentionally allow this call to fail for robustness.
+                        if (XR_FAILED(nextStringToPath(
+                                instance, "/user/hand/left/input/x/click", &actionBindings[index].binding))) {
+                            TraceLoggingWriteTagged(local, "xrSuggestInteractionProfileBindings_InternalError");
+                        }
+                        if (remapXtoMenu) {
+                            TraceLoggingWriteTagged(local,
+                                                    "xrSuggestInteractionProfileBindings",
+                                                    TLArg("RemapToX", "Action"),
+                                                    TLXArg(actionBindings[index].action, "Action"));
+                        }
                     } else if (remapYtoMenu) {
-                        // We intentionally allow this call to fail for robnustness.
-                        nextStringToPath(instance, "/user/hand/left/input/y/click", &actionBindings[index].binding);
+                        // We intentionally allow this call to fail for robustness.
+                        if (XR_FAILED(nextStringToPath(
+                                instance, "/user/hand/left/input/y/click", &actionBindings[index].binding))) {
+                            TraceLoggingWriteTagged(local, "xrSuggestInteractionProfileBindings_InternalError");
+                        }
+                        TraceLoggingWriteTagged(local,
+                                                "xrSuggestInteractionProfileBindings",
+                                                TLArg("RemapToY", "Action"),
+                                                TLXArg(actionBindings[index].action, "Action"));
                     }
                 }
 
@@ -301,14 +370,26 @@ namespace {
                         if (remapXYtoMenu) {
                             for (uint32_t index : entriesForMenuAction) {
                                 state.actionsForMenu.push_back(actionBindings[index].action);
+                                TraceLoggingWriteTagged(local,
+                                                        "xrSuggestInteractionProfileBindings",
+                                                        TLArg("RemapToXY", "Action"),
+                                                        TLXArg(actionBindings[index].action, "Action"));
                             }
 
                             // Make sure we will block X and Y when X+Y is pressed.
                             for (uint32_t index : entriesForXAction) {
                                 state.actionsForX.push_back(actionBindings[index].action);
+                                TraceLoggingWriteTagged(local,
+                                                        "xrSuggestInteractionProfileBindings",
+                                                        TLArg("BlockOnXY", "Action"),
+                                                        TLXArg(actionBindings[index].action, "Action"));
                             }
                             for (uint32_t index : entriesForYAction) {
                                 state.actionsForY.push_back(actionBindings[index].action);
+                                TraceLoggingWriteTagged(local,
+                                                        "xrSuggestInteractionProfileBindings",
+                                                        TLArg("BlockOnXY", "Action"),
+                                                        TLXArg(actionBindings[index].action, "Action"));
                             }
                         }
                     }
@@ -322,11 +403,16 @@ namespace {
         // Chain the call to the next implementation.
         const XrResult result = nextSuggestInteractionProfileBindings(instance, &copySuggestedBindings);
 
+        TraceLoggingWriteStop(local, "xrSuggestInteractionProfileBindings", TLArg((int)result, "Result"));
+
         return result;
     }
 
     // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
     XrResult xrCreateSession(XrInstance instance, const XrSessionCreateInfo* createInfo, XrSession* session) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrCreateSession");
+
         PFN_xrCreateSession nextCreateSession = nullptr;
         {
             std::unique_lock lock(g_instancesMutex);
@@ -348,6 +434,8 @@ namespace {
             g_sessionsToInstances.insert_or_assign(*session, instance);
         }
 
+        TraceLoggingWriteStop(local, "xrCreateSession", TLArg((int)result, "Result"));
+
         return result;
     }
 
@@ -355,6 +443,9 @@ namespace {
     XrResult xrGetActionStateBoolean(XrSession session,
                                      const XrActionStateGetInfo* getInfo,
                                      XrActionStateBoolean* state) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrGetActionStateBoolean");
+
         XrInstance instance = XR_NULL_HANDLE;
         PFN_xrGetActionStateBoolean nextGetActionStateBoolean = nullptr;
         PFN_xrStringToPath nextStringToPath = nullptr;
@@ -400,6 +491,13 @@ namespace {
 
         // Apply our remapping when needed.
         if (XR_SUCCEEDED(result)) {
+            TraceLoggingWriteTagged(local,
+                                    "xrGetActionStateBoolean",
+                                    TLXArg(getInfo->action, "XrAction"),
+                                    TLArg(isMenuAction, "IsMenuAction"),
+                                    TLArg(isXAction, "IsXAction"),
+                                    TLArg(isYAction, "IsYAction"));
+
             if ((isMenuAction || isXAction || isYAction) && state->isActive && state->currentState == XR_TRUE) {
                 // Check the other button.
                 XrActionStateBoolean stateForOther{XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -409,9 +507,15 @@ namespace {
                 nextStringToPath(instance, "/user/hand/left", &getInfoForOther.subactionPath);
                 if (XR_FAILED(nextGetActionStateBoolean(session, &getInfoForOther, &stateForOther))) {
                     getInfoForOther.subactionPath = XR_NULL_PATH;
-                    // We intentionally allow this call to fail for robnustness.
-                    nextGetActionStateBoolean(session, &getInfoForOther, &stateForOther);
+                    // We intentionally allow this call to fail for robustness.
+                    if (XR_FAILED(nextGetActionStateBoolean(session, &getInfoForOther, &stateForOther))) {
+                        TraceLoggingWriteTagged(local, "xrGetActionStateBoolean_InternalError");
+                    }
                 }
+                TraceLoggingWriteTagged(local,
+                                        "xrGetActionStateBoolean",
+                                        TLArg(!!stateForOther.isActive, "OtherActive"),
+                                        TLArg(!!stateForOther.currentState, "OtherCurrentState"));
                 if (stateForOther.isActive) {
                     if (isMenuAction) {
                         // Couple the inputs to emulate the Menu button.
@@ -419,16 +523,20 @@ namespace {
                         state->changedSinceLastSync =
                             state->changedSinceLastSync == XR_TRUE || stateForOther.changedSinceLastSync == XR_TRUE;
                         state->lastChangeTime = std::max(state->lastChangeTime, stateForOther.lastChangeTime);
+                        TraceLoggingWriteTagged(local, "xrGetActionStateBoolean", TLArg("PropagateOther", "Action"));
                     } else if (stateForOther.currentState) {
                         // Block the input when X+Y is pressed.
                         state->currentState = XR_FALSE;
                         state->changedSinceLastSync =
                             state->changedSinceLastSync == XR_TRUE || stateForOther.changedSinceLastSync == XR_TRUE;
                         state->lastChangeTime = std::max(state->lastChangeTime, stateForOther.lastChangeTime);
+                        TraceLoggingWriteTagged(local, "xrGetActionStateBoolean", TLArg("Block", "Action"));
                     }
                 }
             }
         }
+
+        TraceLoggingWriteStop(local, "xrGetActionStateBoolean", TLArg((int)result, "Result"));
 
         return result;
     }
@@ -483,6 +591,9 @@ namespace {
     XrResult xrCreateApiLayerInstance(const XrInstanceCreateInfo* const instanceCreateInfo,
                                       const struct XrApiLayerCreateInfo* const apiLayerInfo,
                                       XrInstance* const instance) {
+        TraceLocalActivity(local);
+        TraceLoggingWriteStart(local, "xrCreateApiLayerInstance");
+
         if (!apiLayerInfo || apiLayerInfo->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO ||
             apiLayerInfo->structVersion != XR_API_LAYER_CREATE_INFO_STRUCT_VERSION ||
             apiLayerInfo->structSize != sizeof(XrApiLayerCreateInfo) || !apiLayerInfo->nextInfo ||
@@ -514,6 +625,7 @@ namespace {
                 newInstance.exeName = fullPath.filename().string();
             }
             newInstance.isOculusXR = startsWith(newInstance.applicationName, "Oculus VR Plugin");
+            TraceLoggingWriteStop(local, "xrCreateApiLayerInstance", TLArg(newInstance.isOculusXR, "IsOculusXR"));
 
 #define GET_XR_PROC(proc)                                                                                              \
     newInstance.nextGetInstanceProcAddr(                                                                               \
@@ -533,6 +645,10 @@ namespace {
             std::unique_lock lock(g_instancesMutex);
             g_instances.insert_or_assign(*instance, std::move(newInstance));
         }
+
+        TraceLoggingWriteStop(
+            local, "xrCreateApiLayerInstance", TLXArg(*instance, "Instance"), TLArg((int)result, "Result"));
+
         return result;
     }
 
@@ -567,4 +683,21 @@ XrResult __declspec(dllexport) XRAPI_CALL
 
     return XR_SUCCESS;
 }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        TraceLoggingRegister(g_traceProvider);
+        break;
+
+    case DLL_PROCESS_DETACH:
+        TraceLoggingUnregister(g_traceProvider);
+        break;
+
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+        break;
+    }
+    return TRUE;
 }
