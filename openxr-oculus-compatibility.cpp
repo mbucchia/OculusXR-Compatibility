@@ -266,7 +266,7 @@ namespace {
         PFN_xrSuggestInteractionProfileBindings nextSuggestInteractionProfileBindings = nullptr;
         PFN_xrStringToPath nextStringToPath = nullptr;
         PFN_xrPathToString nextPathToString = nullptr;
-        bool isOculusXRonSteamVRwithVirtualDesktop = false;
+        bool isSteamVRwithVirtualDesktop = false;
         {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
@@ -275,7 +275,7 @@ namespace {
                 nextSuggestInteractionProfileBindings = state.nextSuggestInteractionProfileBindings;
                 nextStringToPath = state.nextStringToPath;
                 nextPathToString = state.nextPathToString;
-                isOculusXRonSteamVRwithVirtualDesktop = state.isOculusXR && state.isSteamVRwithVirtualDesktop;
+                isSteamVRwithVirtualDesktop = state.isSteamVRwithVirtualDesktop;
             }
         }
         if (!nextSuggestInteractionProfileBindings || !nextStringToPath || !nextPathToString) {
@@ -301,7 +301,7 @@ namespace {
         // bindings for it.
         const bool isOculusTouchInteractionProfile =
             getPath(copySuggestedBindings.interactionProfile) == "/interaction_profiles/oculus/touch_controller";
-        if (isOculusXRonSteamVRwithVirtualDesktop && isOculusTouchInteractionProfile) {
+        if (isSteamVRwithVirtualDesktop && isOculusTouchInteractionProfile) {
             std::vector<uint32_t> entriesForMenuAction;
             std::vector<uint32_t> entriesForXAction;
             std::vector<uint32_t> entriesForYAction;
