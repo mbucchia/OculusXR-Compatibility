@@ -310,7 +310,9 @@ namespace {
             // We intentionally allow this call to fail for robustness.
             nextPathToString(instance, path, sizeof(buf), &count, buf);
             std::string str;
-            str.assign(buf, count - 1);
+            if (count) {
+                str.assign(buf, count - 1);
+            }
             return str;
         };
 
@@ -647,7 +649,7 @@ namespace {
                 newInstance.exeName = fullPath.filename().string();
             }
             newInstance.isOculusXR = startsWith(newInstance.applicationName, "Oculus VR Plugin");
-            TraceLoggingWriteStop(local, "xrCreateApiLayerInstance", TLArg(newInstance.isOculusXR, "IsOculusXR"));
+            TraceLoggingWriteTagged(local, "xrCreateApiLayerInstance", TLArg(newInstance.isOculusXR, "IsOculusXR"));
 
 #define GET_XR_PROC(proc)                                                                                              \
     newInstance.nextGetInstanceProcAddr(                                                                               \
