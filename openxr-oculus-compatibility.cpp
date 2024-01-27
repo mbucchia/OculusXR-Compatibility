@@ -648,7 +648,10 @@ namespace {
                 std::filesystem::path fullPath(path);
                 newInstance.exeName = fullPath.filename().string();
             }
-            newInstance.isOculusXR = startsWith(newInstance.applicationName, "Oculus VR Plugin");
+            HMODULE ovrPlugin;
+            newInstance.isOculusXR =
+                startsWith(newInstance.applicationName, "Oculus VR Plugin") ||
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "OVRPlugin.dll", &ovrPlugin);
             TraceLoggingWriteTagged(local, "xrCreateApiLayerInstance", TLArg(newInstance.isOculusXR, "IsOculusXR"));
 
 #define GET_XR_PROC(proc)                                                                                              \
