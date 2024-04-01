@@ -4,7 +4,7 @@
     "name": "XR_APILAYER_VIRTUALDESKTOP_oculus_compatibility",
     "library_path": ".\\openxr-oculus-compatibility.dll",
     "api_version": "1.0",
-    "implementation_version": "4",
+    "implementation_version": "5",
     "description": "Compatibility layer for OculusXR Plugin",
     "functions": {
       "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
