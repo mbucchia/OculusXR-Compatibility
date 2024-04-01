@@ -237,6 +237,7 @@ namespace {
 
         PFN_xrGetSystemProperties nextGetSystemProperties = nullptr;
         bool isSteamVRwithVirtualDesktop = false;
+        bool isOculusXR = false;
         {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
@@ -244,6 +245,7 @@ namespace {
                 const Instance& state = it->second;
                 nextGetSystemProperties = state.nextGetSystemProperties;
                 isSteamVRwithVirtualDesktop = state.isSteamVRwithVirtualDesktop;
+                isOculusXR = state.isOculusXR;
             }
         }
         if (!nextGetSystemProperties) {
@@ -253,9 +255,10 @@ namespace {
         // Chain the call to the next implementation.
         const XrResult result = nextGetSystemProperties(instance, systemId, properties);
 
-        // When Virtual Desktop is used with SteamVR, we force un-advertise the hand joints capability.
+        // When Virtual Desktop is used with SteamVR and the OculusXR plugin is detected, we force un-advertise the hand
+        // joints capability.
         if (XR_SUCCEEDED(result)) {
-            if (isSteamVRwithVirtualDesktop) {
+            if (isSteamVRwithVirtualDesktop && isOculusXR) {
                 XrSystemHandTrackingPropertiesEXT* handTrackingProperties =
                     reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(properties->next);
                 while (handTrackingProperties) {

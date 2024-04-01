@@ -12,6 +12,6 @@ The following issues are addressed:
 
 - It remaps the left controller X, Y or X+Y buttons (whichever is available first) to the Menu button, to allow bringing in-game menus (as opposed to bringing up the SteamVR dashboard).
 
-- It disables support for `XR_EXT_hand_tracking`, which is causing incorrect motion controller orientation in some games.
+- It disables support for `XR_EXT_hand_tracking` with the OculusXR plugin, which is causing incorrect motion controller orientation in some games.
 
 DISCLAIMER: This software is distributed as-is, without any warranties or conditions of any kind. Use at your own risks.
