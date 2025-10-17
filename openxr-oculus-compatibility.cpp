@@ -136,6 +136,8 @@ namespace {
         PFN_xrGetInstanceProperties nextGetInstanceProperties = nullptr;
         bool isOculusXR = false;
         std::string exeName;
+        bool isSystemQueried = false;
+        bool isSteamVRwithVirtualDesktop = false;
         {
             std::unique_lock lock(g_instancesMutex);
             const auto it = g_instances.find(instance);
@@ -144,6 +146,8 @@ namespace {
                 nextGetInstanceProperties = state.nextGetInstanceProperties;
                 isOculusXR = state.isOculusXR;
                 exeName = state.exeName;
+                isSystemQueried = state.isSystemQueried;
+                isSteamVRwithVirtualDesktop = state.isSteamVRwithVirtualDesktop;
             }
         }
         if (!nextGetInstanceProperties) {
@@ -157,7 +161,17 @@ namespace {
         // if the caller is the OculusXR Plugin, but we return the real runtime name otherwise.
         // Some games (like 7th Guest VR) do not play well when forcing the runtime name, so we exclude them.
         if (XR_SUCCEEDED(result)) {
-            const bool needOculusXrPluginWorkaround = isOculusXR && exeName != "The7thGuestVR-Win64-Shipping.exe";
+            if (!isSystemQueried) {
+                static const bool isVirtualDesktopServiceRunning = IsServiceRunning(L"VirtualDesktop.Server.exe");
+                const std::string_view runtimeName(instanceProperties->runtimeName);
+                const bool isSteamVR = runtimeName == "SteamVR/OpenXR";
+
+                isSteamVRwithVirtualDesktop = isSteamVR && isVirtualDesktopServiceRunning;
+            }
+
+            const bool needOculusXrPluginWorkaround = isSteamVRwithVirtualDesktop && isOculusXR &&
+                                                      exeName != "The7thGuestVR-Win64-Shipping.exe" &&
+                                                      exeName != "Atlas-Win64-Shipping.exe";
             if (needOculusXrPluginWorkaround) {
                 TraceLoggingWriteTagged(local, "xrGetInstanceProperties", TLArg("OverrideRuntimeName", "Action"));
                 sprintf_s(instanceProperties->runtimeName, sizeof(instanceProperties->runtimeName), "Oculus");
@@ -688,9 +702,9 @@ extern "C" {
 
 // Entry point for the loader.
 XrResult __declspec(dllexport) XRAPI_CALL
-    xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* const loaderInfo,
-                                       const char* const apiLayerName,
-                                       XrNegotiateApiLayerRequest* const apiLayerRequest) {
+xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* const loaderInfo,
+                                   const char* const apiLayerName,
+                                   XrNegotiateApiLayerRequest* const apiLayerRequest) {
     if (!loaderInfo || !apiLayerName || !apiLayerRequest ||
         loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
         loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
